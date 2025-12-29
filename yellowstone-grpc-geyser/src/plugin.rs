@@ -15,7 +15,6 @@ use {
             atomic::{AtomicBool, Ordering},
             Arc, Mutex,
         },
-        time::Duration,
     },
     tokio::{
         runtime::{Builder, Runtime},
@@ -75,11 +74,7 @@ impl GeyserPlugin for Plugin {
         if let Some(worker_threads) = config.tokio.worker_threads {
             builder.worker_threads(worker_threads);
         }
-        if let Some(tokio_cpus) = config.tokio.affinity.clone() {
-            builder.on_thread_start(move || {
-                affinity::set_thread_affinity(&tokio_cpus).expect("failed to set affinity")
-            });
-        }
+
         let runtime = builder
             .thread_name_fn(crate::get_thread_name)
             .enable_all()
@@ -128,7 +123,7 @@ impl GeyserPlugin for Plugin {
             inner.grpc_shutdown.notify_one();
             drop(inner.grpc_channel);
             inner.prometheus.shutdown();
-            inner.runtime.shutdown_timeout(Duration::from_secs(30));
+            inner.runtime.shutdown_background();
         }
     }
 

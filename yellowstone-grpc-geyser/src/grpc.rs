@@ -456,11 +456,6 @@ impl GrpcService {
             if let Some(worker_threads) = config_tokio.worker_threads {
                 builder.worker_threads(worker_threads);
             }
-            if let Some(tokio_cpus) = config_tokio.affinity.clone() {
-                builder.on_thread_start(move || {
-                    affinity::set_thread_affinity(&tokio_cpus).expect("failed to set affinity")
-                });
-            }
             builder
                 .thread_name_fn(crate::get_thread_name)
                 .enable_all()
