@@ -14,7 +14,7 @@ use {
         },
         message::{
             CommitmentLevel, Message, MessageAccount, MessageBlock, MessageBlockMeta, MessageEntry,
-            MessageSlot, MessageTransaction, SlotStatus,
+            MessageSlot, MessageTransaction,
         },
     },
     base64::{engine::general_purpose::STANDARD as base64_engine, Engine},
@@ -230,16 +230,12 @@ impl Filter {
         self.commitment
     }
 
-    pub fn get_updates(
-        &self,
-        message: &Message,
-        commitment: Option<CommitmentLevel>,
-    ) -> FilteredUpdates {
+    pub fn get_updates(&self, message: &Message) -> FilteredUpdates {
         match message {
             Message::Account(message) => self
                 .accounts
                 .get_updates(message, &self.accounts_data_slice),
-            Message::Slot(message) => self.slots.get_updates(message, commitment),
+            Message::Slot(message) => self.slots.get_updates(message),
             Message::Transaction(message) => {
                 let mut updates = self.transactions.get_updates(message);
                 updates.append(&mut self.transactions_status.get_updates(message));
@@ -438,7 +434,7 @@ impl FilterAccountsState {
         Ok(this)
     }
 
-    fn is_empty(&self) -> bool {
+    const fn is_empty(&self) -> bool {
         self.memcmp.is_empty()
             && self.datasize.is_none()
             && !self.token_account_state
@@ -587,19 +583,7 @@ impl<'a> FilterAccountsMatch<'a> {
 }
 
 #[derive(Debug, Default, Clone, Copy)]
-struct FilterSlotsInner {
-    filter_by_commitment: bool,
-    interslot_updates: bool,
-}
-
-impl FilterSlotsInner {
-    fn new(filter: SubscribeRequestFilterSlots) -> Self {
-        Self {
-            filter_by_commitment: filter.filter_by_commitment.unwrap_or_default(),
-            interslot_updates: filter.interslot_updates.unwrap_or_default(),
-        }
-    }
-}
+struct FilterSlotsInner {}
 
 #[derive(Debug, Default, Clone)]
 struct FilterSlots {
@@ -616,40 +600,21 @@ impl FilterSlots {
 
         Ok(Self {
             filters: configs
-                .iter()
-                .map(|(name, filter)| {
+                .keys()
+                .map(|name| {
                     names
                         .get(name)
-                        .map(|name| (name, FilterSlotsInner::new(*filter)))
+                        .map(|name| (name, FilterSlotsInner::default()))
                 })
                 .collect::<Result<_, _>>()?,
         })
     }
 
-    fn get_updates(
-        &self,
-        message: &MessageSlot,
-        commitment: Option<CommitmentLevel>,
-    ) -> FilteredUpdates {
+    fn get_updates(&self, message: &MessageSlot) -> FilteredUpdates {
         let filters = self
             .filters
-            .iter()
-            .filter_map(|(name, inner)| {
-                if (!inner.filter_by_commitment
-                    || commitment
-                        .map(|commitment| commitment == message.status)
-                        .unwrap_or(false))
-                    && (inner.interslot_updates
-                        || matches!(
-                            message.status,
-                            SlotStatus::Processed | SlotStatus::Confirmed | SlotStatus::Finalized
-                        ))
-                {
-                    Some(name.clone())
-                } else {
-                    None
-                }
-            })
+            .keys()
+            .cloned()
             .collect::<FilteredUpdateFilters>();
         filtered_updates_once_owned!(
             filters,
@@ -830,8 +795,8 @@ impl FilterEntries {
 
         Ok(Self {
             filters: configs
-                .iter()
-                .map(|(name, _filter)| names.get(name))
+                .keys()
+                .map(|name| names.get(name))
                 .collect::<Result<_, _>>()?,
         })
     }
@@ -992,8 +957,8 @@ impl FilterBlocksMeta {
 
         Ok(Self {
             filters: configs
-                .iter()
-                .map(|(name, _filter)| names.get(name))
+                .keys()
+                .map(|name| names.get(name))
                 .collect::<Result<_, _>>()?,
         })
     }
@@ -1364,7 +1329,7 @@ mod tests {
         let message_transaction =
             create_message_transaction(&keypair_b, vec![account_key_b, account_key_a]);
         let message = Message::Transaction(message_transaction);
-        let updates = filter.get_updates(&message, None);
+        let updates = filter.get_updates(&message);
         assert_eq!(updates.len(), 1);
         assert_eq!(
             updates[0].filters,
@@ -1377,7 +1342,7 @@ mod tests {
 
         config.transactions_status = transactions;
         let filter = Filter::new(&config, &limit, &mut create_filter_names()).unwrap();
-        let updates = filter.get_updates(&message, None);
+        let updates = filter.get_updates(&message);
         assert_eq!(updates.len(), 2);
         assert_eq!(
             updates[1].filters,
@@ -1429,7 +1394,7 @@ mod tests {
         let message_transaction =
             create_message_transaction(&keypair_b, vec![account_key_b, account_key_a]);
         let message = Message::Transaction(message_transaction);
-        let updates = filter.get_updates(&message, None);
+        let updates = filter.get_updates(&message);
         assert_eq!(updates.len(), 1);
         assert_eq!(
             updates[0].filters,
@@ -1442,7 +1407,7 @@ mod tests {
 
         config.transactions_status = transactions;
         let filter = Filter::new(&config, &limit, &mut create_filter_names()).unwrap();
-        let updates = filter.get_updates(&message, None);
+        let updates = filter.get_updates(&message);
         assert_eq!(updates.len(), 2);
         assert_eq!(
             updates[1].filters,
@@ -1494,7 +1459,7 @@ mod tests {
         let message_transaction =
             create_message_transaction(&keypair_b, vec![account_key_b, account_key_a]);
         let message = Message::Transaction(message_transaction);
-        for message in filter.get_updates(&message, None) {
+        for message in filter.get_updates(&message) {
             assert!(message.filters.is_empty());
         }
     }
@@ -1547,7 +1512,7 @@ mod tests {
             vec![account_key_x, account_key_y, account_key_z],
         );
         let message = Message::Transaction(message_transaction);
-        let updates = filter.get_updates(&message, None);
+        let updates = filter.get_updates(&message);
         assert_eq!(updates.len(), 1);
         assert_eq!(
             updates[0].filters,
@@ -1560,7 +1525,7 @@ mod tests {
 
         config.transactions_status = transactions;
         let filter = Filter::new(&config, &limit, &mut create_filter_names()).unwrap();
-        let updates = filter.get_updates(&message, None);
+        let updates = filter.get_updates(&message);
         assert_eq!(updates.len(), 2);
         assert_eq!(
             updates[1].filters,
@@ -1618,7 +1583,7 @@ mod tests {
         let message_transaction =
             create_message_transaction(&keypair_x, vec![account_key_x, account_key_z]);
         let message = Message::Transaction(message_transaction);
-        for message in filter.get_updates(&message, None) {
+        for message in filter.get_updates(&message) {
             assert!(message.filters.is_empty());
         }
     }

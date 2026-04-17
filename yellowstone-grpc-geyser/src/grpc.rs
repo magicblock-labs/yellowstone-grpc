@@ -961,22 +961,18 @@ impl GrpcService {
 
                     for message in messages_vec.into_iter().rev() {
                         if let Message::Slot(slot) = &message.1 {
-                            let (mut confirmed_messages, mut finalized_messages) = match slot.status {
-                                SlotStatus::Processed | SlotStatus::FirstShredReceived | SlotStatus::Completed | SlotStatus::CreatedBank | SlotStatus::Dead => {
-                                    (Vec::with_capacity(1), Vec::with_capacity(1))
-                                }
+                            match slot.status {
+                                SlotStatus::Processed
+                                | SlotStatus::FirstShredReceived
+                                | SlotStatus::Completed
+                                | SlotStatus::CreatedBank
+                                | SlotStatus::Dead => {}
                                 SlotStatus::Confirmed => {
                                     if let Some(slot_messages) = messages.get_mut(&slot.slot) {
                                         if !slot_messages.sealed {
                                             slot_messages.confirmed_at = Some(slot_messages.messages.len());
                                         }
                                     }
-
-                                    let vec = messages
-                                        .get(&slot.slot)
-                                        .map(|slot_messages| slot_messages.messages.iter().flatten().cloned().collect())
-                                        .unwrap_or_default();
-                                    (vec, Vec::with_capacity(1))
                                 }
                                 SlotStatus::Finalized => {
                                     if let Some(slot_messages) = messages.get_mut(&slot.slot) {
@@ -984,12 +980,6 @@ impl GrpcService {
                                             slot_messages.finalized_at = Some(slot_messages.messages.len());
                                         }
                                     }
-
-                                    let vec = messages
-                                        .get_mut(&slot.slot)
-                                        .map(|slot_messages| slot_messages.messages.iter().flatten().cloned().collect())
-                                        .unwrap_or_default();
-                                    (Vec::with_capacity(1), vec)
                                 }
                             };
 
@@ -1004,15 +994,8 @@ impl GrpcService {
                                 .as_mut()
                                 .reset(Instant::now() + PROCESSED_MESSAGES_SLEEP);
 
-                            // confirmed
-                            confirmed_messages.push(message.clone());
-                            let _ =
-                                broadcast_tx.send((CommitmentLevel::Confirmed, confirmed_messages.into()));
-
-                            // finalized
-                            finalized_messages.push(message);
-                            let _ =
-                                broadcast_tx.send((CommitmentLevel::Finalized, finalized_messages.into()));
+                            // Commitment-specific delivery is intentionally disabled for this fork.
+                            // Every subscriber consumes the processed stream once.
                         } else {
                             let mut confirmed_messages = vec![];
                             let mut finalized_messages = vec![];
@@ -1046,15 +1029,7 @@ impl GrpcService {
                                     .reset(Instant::now() + PROCESSED_MESSAGES_SLEEP);
                             }
 
-                            if !confirmed_messages.is_empty() {
-                                let _ =
-                                    broadcast_tx.send((CommitmentLevel::Confirmed, confirmed_messages.into()));
-                            }
-
-                            if !finalized_messages.is_empty() {
-                                let _ =
-                                    broadcast_tx.send((CommitmentLevel::Finalized, finalized_messages.into()));
-                            }
+                            // Commitment-specific delivery is intentionally disabled for this fork.
                         }
                     }
                 }
@@ -1197,8 +1172,7 @@ impl GrpcService {
                                 };
 
                                 let (tx, rx) = oneshot::channel();
-                                let commitment = session.filter.get_commitment_level();
-                                if let Err(_error) = replay_stored_slots_tx.send((commitment, from_slot, tx)).await {
+                                if let Err(_error) = replay_stored_slots_tx.send((CommitmentLevel::Processed, from_slot, tx)).await {
                                     error!("client #{id}: failed to send from_slot request");
                                     task_tracker.spawn(async move {
                                         let _ = stream_tx.send(Err(Status::internal("failed to send from_slot request"))).await;
@@ -1232,7 +1206,7 @@ impl GrpcService {
 
                                 messages.sort_by_key(|msg| msg.0);
                                 for (_msgid, message) in messages.iter() {
-                                    for message in session.filter.get_updates(message, Some(commitment)) {
+                                    for message in session.filter.get_updates(message) {
                                         let proto_size = message.encoded_len().min(u32::MAX as usize) as u32;
                                         match stream_tx.send(Ok(message)).await {
                                             Ok(()) => {
@@ -1276,28 +1250,26 @@ impl GrpcService {
                         }
                     };
 
-                    if commitment == session.filter.get_commitment_level() {
-                        for (_msgid, message) in messages.iter() {
-                            for message in session.filter.get_updates(message, Some(commitment)) {
-                                let proto_size = message.encoded_len().min(u32::MAX as usize) as u32;
-                                match stream_tx.try_send(Ok(message)) {
-                                    Ok(()) => {
-                                        metrics::incr_grpc_message_sent_counter(&session.subscriber_id);
-                                        metrics::incr_grpc_bytes_sent(&session.subscriber_id, proto_size);
-                                    }
-                                    Err(mpsc::error::TrySendError::Full(_)) => {
-                                        error!("client #{id}: lagged to send an update");
-                                        task_tracker.spawn(async move {
-                                            let _ = stream_tx.send(Err(Status::internal("lagged to send an update"))).await;
-                                        });
-                                        session.disconnect_reason = "client_channel_full";
-                                        break 'outer;
-                                    }
-                                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                                        error!("client #{id}: stream closed");
-                                        session.disconnect_reason = "client_closed";
-                                        break 'outer;
-                                    }
+                    for (_msgid, message) in messages.iter() {
+                        for message in session.filter.get_updates(message) {
+                            let proto_size = message.encoded_len().min(u32::MAX as usize) as u32;
+                            match stream_tx.try_send(Ok(message)) {
+                                Ok(()) => {
+                                    metrics::incr_grpc_message_sent_counter(&session.subscriber_id);
+                                    metrics::incr_grpc_bytes_sent(&session.subscriber_id, proto_size);
+                                }
+                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                    error!("client #{id}: lagged to send an update");
+                                    task_tracker.spawn(async move {
+                                        let _ = stream_tx.send(Err(Status::internal("lagged to send an update"))).await;
+                                    });
+                                    session.disconnect_reason = "client_channel_full";
+                                    break 'outer;
+                                }
+                                Err(mpsc::error::TrySendError::Closed(_)) => {
+                                    error!("client #{id}: stream closed");
+                                    session.disconnect_reason = "client_closed";
+                                    break 'outer;
                                 }
                             }
                         }
@@ -1381,7 +1353,7 @@ impl GrpcService {
                 }
             };
 
-            for message in filter.get_updates(&message, None) {
+            for message in filter.get_updates(&message) {
                 if stream_tx.send(Ok(message)).await.is_err() {
                     error!("client #{id}: stream closed");
                     return Err(ClientSnapshotReplayError::ClientGrpcConnectionClosed);
