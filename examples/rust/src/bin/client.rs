@@ -640,9 +640,7 @@ async fn main() -> anyhow::Result<()> {
         }
         .inspect_err(|error| error!("failed to connect: {error}"))
     })
-    .await
-    .map_err(Into::into)
-}
+    .await}
 
 async fn geyser_health_watch(mut client: GeyserGrpcClient<impl Interceptor>) -> anyhow::Result<()> {
     let mut stream = client.health_watch().await?;
