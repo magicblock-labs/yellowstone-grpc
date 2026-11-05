@@ -3,14 +3,14 @@ use {
         config::Config,
         contact_info::ContactInfoNotification,
         file_watcher::FileWatcher,
-        grpc::{BlockReconstructionMessage, GrpcService, SubscriberChannels},
+        grpc::GrpcService,
         metrics::{self, incr_geyser_event_dropped, PrometheusService},
         plugin::{
             filter::limits::FilterLimits,
             message::{
-                CommitmentLevel, ContactInfoMessage, Message, MessageAccount, MessageBlockMeta,
-                MessageContactInfo, MessageContactInfoRemoved, MessageDeshredTransaction,
-                MessageEntry, MessageSlot, MessageTransaction,
+                ContactInfoMessage, Message, MessageAccount, MessageBlockMeta, MessageContactInfo,
+                MessageContactInfoRemoved, MessageDeshredTransaction, MessageEntry, MessageSlot,
+                MessageTransaction,
             },
         },
         stream::tokio::BatchStreamUnboundedReceiver,
@@ -48,8 +48,6 @@ pub struct PluginInner {
     grpc_channel: mpsc::UnboundedSender<Message>, // geyser_loop
     deshred_channel: broadcast::Sender<Message>,  // deshred_client_loop
     contact_info_channel: mpsc::UnboundedSender<ContactInfoNotification>,
-    block_reconstruction_channel: mpsc::UnboundedSender<BlockReconstructionMessage>, // block_reconstruction_loop
-    broadcast_channel: SubscriberChannels,                                           // client_loop
     blocks_meta_tx: Option<mpsc::UnboundedSender<Message>>,
     plugin_cancellation_token: CancellationToken,
     plugin_task_tracker: TaskTracker,
@@ -69,18 +67,6 @@ impl PluginInner {
         if let Ok(count) = self.deshred_channel.send(message) {
             metrics::deshred_queue_size_inc(count as i64);
         }
-    }
-
-    // Sends messages to the block reconstruction loop
-    fn send_block_reconstruction_message(&self, message: BlockReconstructionMessage) {
-        if self.block_reconstruction_channel.send(message).is_ok() {
-            metrics::block_reconstruction_queue_size_inc();
-        }
-    }
-
-    // Sends messages to all subscribed clients if their filter matches the message.
-    fn send_broadcast_message(&self, commitment: CommitmentLevel, messages: Arc<Vec<Message>>) {
-        self.broadcast_channel.send(commitment, messages);
     }
 
     // Sends messages to block meta storage
@@ -140,12 +126,6 @@ impl GeyserPlugin for Plugin {
         let mut builder = Builder::new_multi_thread();
         if let Some(worker_threads) = config.tokio.worker_threads {
             builder.worker_threads(worker_threads);
-        }
-        if let Some(tokio_cpus) = config.tokio.affinity.clone() {
-            builder.on_thread_start(move || {
-                crate::util::cpu_core_affinity::set_thread_affinity(&tokio_cpus)
-                    .expect("failed to set affinity")
-            });
         }
         let plugin_cancellation_token = CancellationToken::new();
         let plugin_task_tracker = TaskTracker::new();
@@ -214,8 +194,6 @@ impl GeyserPlugin for Plugin {
             grpc_channel: grpc_channel_tx,
             deshred_channel: grpc_service_result.deshred_broadcast_tx,
             contact_info_channel: grpc_service_result.contact_info_tx,
-            block_reconstruction_channel: grpc_service_result.block_reconstruction_tx,
-            broadcast_channel: grpc_service_result.broadcast,
             blocks_meta_tx: grpc_service_result.blocks_meta_tx,
             plugin_cancellation_token,
             plugin_task_tracker,
@@ -314,39 +292,8 @@ impl GeyserPlugin for Plugin {
     ) -> PluginResult<()> {
         self.with_inner(|inner| {
             let message = Message::Slot(Arc::new(MessageSlot::from_geyser(slot, parent, status)));
-            if matches!(
-                status,
-                SlotStatus::Processed | SlotStatus::Confirmed | SlotStatus::Rooted
-            ) {
-                // Processed/Confirmed/Finalized slot status updates are handled by the block reconstruction loop and are never directly exposed by the processed message loop (geyser_loop.)
-                // If they were to be sent through geyser_loop, the block_reconstruction_loop would also send them, resulting in duplicate slot life-cycle messages.
-                // By sending them directly to block_reconstruction_loop, we avoid this issue while ensuring block reconstruction happens as normal.
-                inner.send_block_reconstruction_message(BlockReconstructionMessage::Single(
-                    message.clone(),
-                ));
-            } else {
-                // The only remaining states are FirstShredReceived/Completed/CreatedBank/Dead.
-                // These states are used by both block reconstruction and the geyser_loop (processed message loop).
-                // When sending to geyser_loop, the loop will batch all messages (whether it's slot updates, account updates, or transaction updates) and send them to the block_reconstruction_loop in a single batch.
-                // CreatedBank in particular is critical to the life-cycle of a block reconstruction, but it is not forwarded to the subscribed client from block_reconstruction_loop, so it must be sent to geyser_loop to ensure subscribers receive it.
-                inner.send_message(message.clone());
-
-                // Note: The following if statement remains here in case of any future additions to a slot's life-cycle state.
-                // It could be removed as it is right now, since we've already filtered out all other states above, but it is left here for clarity and future-proofing.
-                if matches!(
-                    status,
-                    SlotStatus::FirstShredReceived
-                        | SlotStatus::Completed
-                        | SlotStatus::CreatedBank
-                        | SlotStatus::Dead(_)
-                ) {
-                    // FirstShredReceived/Completed/CreatedBank/Dead slot status updates for Confirmed/Finalized commitment subscribers are not explicitly sent by the block reconstruction loop.
-                    // Therefore we explicitly need to forward these updates to the subscribers for all commitment levels, the geyser_loop will take care of forwarding them to the Processed commitment level.
-                    let messages = Arc::new(vec![message.clone()]);
-                    inner.send_broadcast_message(CommitmentLevel::Confirmed, Arc::clone(&messages));
-                    inner.send_broadcast_message(CommitmentLevel::Finalized, messages);
-                }
-            }
+            // MBV emits rooted slots without the Agave bank lifecycle.
+            inner.send_message(message.clone());
 
             // Deshred subscribers need to receive all slot status updates.
             inner.send_deshred_message(message.clone());

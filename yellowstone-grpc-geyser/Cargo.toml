@@ -91,10 +91,6 @@ yellowstone-grpc-proto = { workspace = true, features = ["tonic", "account-data-
 yellowstone-block-machine = { workspace = true, default-features = false }
 yellowstone-grpc-tools = { workspace = true }
 
-[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
-# wrapped in mod cpu_core_affinity
-affinity = { workspace = true }
-
 [[bench]]
 name = "encode"
 harness = false

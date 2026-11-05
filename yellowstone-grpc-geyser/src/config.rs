@@ -129,18 +129,6 @@ fn parse_taskset(taskset: &str) -> Result<Vec<usize>, String> {
     let mut vec = set.into_iter().collect::<Vec<usize>>();
     vec.sort();
 
-    if let Some(set_max_index) = vec.last().copied() {
-        let max_index = crate::util::cpu_core_affinity::get_thread_affinity()
-            .map_err(|_err| "failed to get affinity".to_owned())?
-            .into_iter()
-            .max()
-            .unwrap_or(0);
-
-        if set_max_index > max_index {
-            return Err(format!("core index must be in the range [0, {max_index}]"));
-        }
-    }
-
     Ok(vec)
 }
 
@@ -308,10 +296,10 @@ pub struct ConfigGrpc {
     /// Capacity of the processed broadcast ring, defaults to `channel_capacity`
     #[serde(default, deserialize_with = "deserialize_int_str_maybe")]
     pub processed_broadcast_capacity: Option<usize>,
-    /// Capacity of the confirmed broadcast ring, defaults to `channel_capacity`
+    /// Accepted for compatibility; all subscribers use the processed broadcast ring.
     #[serde(default, deserialize_with = "deserialize_int_str_maybe")]
     pub confirmed_broadcast_capacity: Option<usize>,
-    /// Capacity of the finalized broadcast ring, defaults to `channel_capacity`
+    /// Accepted for compatibility; all subscribers use the processed broadcast ring.
     #[serde(default, deserialize_with = "deserialize_int_str_maybe")]
     pub finalized_broadcast_capacity: Option<usize>,
     #[serde(default = "ConfigGrpc::default_contact_info_channel_capacity")]

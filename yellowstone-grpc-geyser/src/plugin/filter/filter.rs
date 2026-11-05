@@ -152,7 +152,6 @@ pub struct Filter {
     entries: FilterEntries,
     blocks: FilterBlocks,
     blocks_meta: FilterBlocksMeta,
-    commitment: CommitmentLevel,
     accounts_data_slice: FilterAccountsDataSlice,
     ping: Option<i32>,
 }
@@ -173,7 +172,6 @@ impl Default for Filter {
             entries: FilterEntries::default(),
             blocks: FilterBlocks::default(),
             blocks_meta: FilterBlocksMeta::default(),
-            commitment: CommitmentLevel::Processed,
             accounts_data_slice: FilterAccountsDataSlice::default(),
             ping: None,
         }
@@ -235,6 +233,10 @@ impl Filter {
         limits: &FilterLimits,
         names: &mut FilterNames,
     ) -> FilterResult<Self> {
+        if let Some(commitment) = config.commitment {
+            CommitmentLevelProto::try_from(commitment)
+                .map_err(|_| FilterError::InvalidCommitment { commitment })?;
+        }
         Ok(Self {
             accounts: FilterAccounts::new(&config.accounts, &limits.accounts, names)?,
             slots: FilterSlots::new(&config.slots, &limits.slots, names)?,
@@ -253,7 +255,6 @@ impl Filter {
             entries: FilterEntries::new(&config.entry, &limits.entries, names)?,
             blocks: FilterBlocks::new(&config.blocks, &limits.blocks, names)?,
             blocks_meta: FilterBlocksMeta::new(&config.blocks_meta, &limits.blocks_meta, names)?,
-            commitment: Self::decode_commitment(config.commitment)?,
             accounts_data_slice: FilterAccountsDataSlice::new(
                 &config.accounts_data_slice,
                 limits.accounts.data_slice_max,
@@ -344,23 +345,6 @@ impl Filter {
         }
     }
 
-    fn decode_commitment(commitment: Option<i32>) -> FilterResult<CommitmentLevel> {
-        let commitment = commitment.unwrap_or(CommitmentLevelProto::Processed as i32);
-        let commitment = CommitmentLevelProto::try_from(commitment)
-            .map(Into::into)
-            .map_err(|_error| FilterError::InvalidCommitment { commitment })?;
-        if !matches!(
-            commitment,
-            CommitmentLevel::Processed | CommitmentLevel::Confirmed | CommitmentLevel::Finalized
-        ) {
-            Err(FilterError::InvalidCommitment {
-                commitment: commitment as i32,
-            })
-        } else {
-            Ok(commitment)
-        }
-    }
-
     fn decode_pubkeys<'a>(
         pubkeys: &'a [String],
         limit: &'a FoldHashSet<Pubkey>,
@@ -404,20 +388,16 @@ impl Filter {
         ]
     }
 
-    pub const fn get_commitment_level(&self) -> CommitmentLevel {
-        self.commitment
-    }
-
     pub fn get_updates(
         &self,
         message: &Message,
-        commitment: Option<CommitmentLevel>,
+        _commitment: Option<CommitmentLevel>,
     ) -> FilteredUpdates {
         match message {
             Message::Account(message) => self
                 .accounts
                 .get_updates(message, &self.accounts_data_slice),
-            Message::Slot(message) => self.slots.get_updates(message, commitment),
+            Message::Slot(message) => self.slots.get_updates(message),
             Message::Transaction(message) => {
                 let mut updates = self.transactions.get_updates(message);
                 updates.append(&mut self.transactions_status.get_updates(message));
@@ -1483,30 +1463,11 @@ impl FilterSlots {
         })
     }
 
-    fn get_updates(
-        &self,
-        message: &MessageSlot,
-        commitment: Option<CommitmentLevel>,
-    ) -> FilteredUpdates {
+    fn get_updates(&self, message: &MessageSlot) -> FilteredUpdates {
         let filters = self
             .filters
-            .iter()
-            .filter_map(|(name, inner)| {
-                if (!inner.filter_by_commitment
-                    || commitment
-                        .map(|commitment| commitment == message.status)
-                        .unwrap_or(false))
-                    && (inner.interslot_updates
-                        || matches!(
-                            message.status,
-                            SlotStatus::Processed | SlotStatus::Confirmed | SlotStatus::Finalized
-                        ))
-                {
-                    Some(name.clone())
-                } else {
-                    None
-                }
-            })
+            .keys()
+            .cloned()
             .collect::<FilteredUpdateFilters>();
         filtered_updates_once_owned!(
             filters,
@@ -4675,23 +4636,18 @@ mod filter_kind_coverage {
     }
 
     #[test]
-    fn slot_status_and_interslot_updates_gate_delivery() {
+    /// Proves normal subscriptions deliver every slot status regardless of interslot flags.
+    fn slot_status_ignores_interslot_gating() {
         for interslot in [None, Some(false), Some(true)] {
             let filter = build(slots_request(None, interslot));
-            let wants_all = interslot == Some(true);
 
             for status in ALL_SLOT_STATUSES {
                 let updates = filter.get_updates(
                     &Message::Slot(Arc::new(fixtures::message_slot(42, status))),
                     None,
                 );
-                let commitment_bearing = matches!(
-                    status,
-                    SlotStatus::Processed | SlotStatus::Confirmed | SlotStatus::Finalized
-                );
-                assert_eq!(
+                assert!(
                     !updates.is_empty(),
-                    wants_all || commitment_bearing,
                     "interslot={interslot:?} status={status:?}"
                 );
             }
@@ -4699,14 +4655,15 @@ mod filter_kind_coverage {
     }
 
     #[test]
-    fn slot_filter_by_commitment_requires_matching_commitment() {
+    /// Proves slot delivery ignores the requested commitment.
+    fn slot_filter_ignores_commitment() {
         let filter = build(slots_request(Some(true), Some(true)));
 
         for status in ALL_SLOT_STATUSES {
             let message = Message::Slot(Arc::new(fixtures::message_slot(42, status)));
 
             assert!(
-                filter.get_updates(&message, None).is_empty(),
+                !filter.get_updates(&message, None).is_empty(),
                 "status={status:?} with no commitment"
             );
 
@@ -4716,9 +4673,8 @@ mod filter_kind_coverage {
                 CommitmentLevel::Finalized,
             ] {
                 let updates = filter.get_updates(&message, Some(commitment));
-                assert_eq!(
+                assert!(
                     !updates.is_empty(),
-                    commitment == status,
                     "status={status:?} commitment={commitment:?}"
                 );
             }
